@@ -219,19 +219,24 @@ export class CharacterController {
   }
 
   handleKeyDown(e) {
-    switch (e.key.toLowerCase()) {
+    const key = e.key.toLowerCase();
+    switch (key) {
       case "w":
       case "z":
+      case "arrowup":
         this.keys.forward = true;
         break;
       case "s":
+      case "arrowdown":
         this.keys.backward = true;
         break;
       case "a":
       case "q":
+      case "arrowleft":
         this.keys.left = true;
         break;
       case "d":
+      case "arrowright":
         this.keys.right = true;
         break;
       case "shift":
@@ -256,19 +261,24 @@ export class CharacterController {
   }
 
   handleKeyUp(e) {
-    switch (e.key.toLowerCase()) {
+    const key = e.key.toLowerCase();
+    switch (key) {
       case "w":
       case "z":
+      case "arrowup":
         this.keys.forward = false;
         break;
       case "s":
+      case "arrowdown":
         this.keys.backward = false;
         break;
       case "a":
       case "q":
+      case "arrowleft":
         this.keys.left = false;
         break;
       case "d":
+      case "arrowright":
         this.keys.right = false;
         break;
       case "shift":
