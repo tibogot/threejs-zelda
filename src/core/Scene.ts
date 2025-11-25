@@ -381,8 +381,9 @@ export class GameScene {
     }
 
     // Step physics FIRST (as per usage example: world.step() then character.update())
+    let interpolationAlpha = 0;
     if (this.physicsManager.isInitialized()) {
-      this.physicsManager.step(deltaTime);
+      interpolationAlpha = this.physicsManager.step(deltaTime);
       // Update debug renderer
       this.rapierDebugRenderer.update(this.physicsManager.getWorld());
     }
@@ -390,7 +391,7 @@ export class GameScene {
     // Update character (handles input, animation, and camera internally)
     // Character reads position from physics body after step
     if (this.characterController) {
-      this.characterController.update(deltaTime);
+      this.characterController.update(deltaTime, interpolationAlpha);
     }
 
     // Update camera based on mode

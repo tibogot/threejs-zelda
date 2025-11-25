@@ -41,6 +41,13 @@ export class CharacterController {
     // Physics body
     this.rigidBody = null;
     this.colliderDesc = null;
+    this.collider = null; // Store collider handle for dynamic updates
+    this.currentCapsuleHalfHeight = this.config.capsuleHeight / 2; // Track current capsule half height
+    this.currentCharacterYOffset = this.config.yPosition; // Track current character model Y offset
+
+    // Interpolation for smooth rendering
+    this.prevPosition = new THREE.Vector3();
+    this.currentPosition = new THREE.Vector3();
 
     // Character groups
     this.container = new THREE.Group();
@@ -69,6 +76,7 @@ export class CharacterController {
     this.actions = {};
     this.currentAnimation = "idle";
     this.currentAction = null;
+    this.animationChangeCooldown = 0;
 
     // State
     this.isGrounded = true;
@@ -252,6 +260,7 @@ export class CharacterController {
         this.keys.dance = true;
         break;
       case "alt":
+      case "f":
         this.keys.roll = true;
         break;
       case "r":
@@ -294,6 +303,7 @@ export class CharacterController {
         this.keys.dance = false;
         break;
       case "alt":
+      case "f":
         this.keys.roll = false;
         break;
     }
@@ -438,6 +448,14 @@ export class CharacterController {
   setAnimation(animName) {
     if (this.currentAnimation === animName) return;
 
+    // Prevent rapid animation switches (except for jump/land animations which need to be immediate)
+    const priorityAnimations = ["jumpStart", "jumpLoop", "jumpLand", "roll"];
+    const isPriority = priorityAnimations.includes(animName);
+
+    if (!isPriority && this.animationChangeCooldown > 0) {
+      return;
+    }
+
     const mappedName = this.animationMap[animName] || this.animationMap.idle;
     const nextAction = this.actions[mappedName];
 
@@ -447,18 +465,23 @@ export class CharacterController {
     }
 
     if (this.currentAction) {
-      this.currentAction.fadeOut(0.2);
+      this.currentAction.fadeOut(0.15);
     }
 
     nextAction
       .reset()
       .setEffectiveTimeScale(1)
       .setEffectiveWeight(1)
-      .fadeIn(0.2)
+      .fadeIn(0.15)
       .play();
 
     this.currentAction = nextAction;
     this.currentAnimation = animName;
+
+    // Set cooldown for non-priority animations
+    if (!isPriority) {
+      this.animationChangeCooldown = 0.1;
+    }
   }
 
   createPhysicsBody(position = [0, 2, 0]) {
@@ -475,6 +498,10 @@ export class CharacterController {
 
     this.rigidBody = this.world.createRigidBody(rigidBodyDesc);
 
+    // Initialize interpolation positions
+    this.prevPosition.set(position[0], position[1], position[2]);
+    this.currentPosition.set(position[0], position[1], position[2]);
+
     // Create capsule collider
     const halfHeight = this.config.capsuleHeight / 2;
     this.colliderDesc = RAPIER.ColliderDesc.capsule(
@@ -484,10 +511,71 @@ export class CharacterController {
       .setFriction(0.5)
       .setRestitution(0);
 
-    this.world.createCollider(this.colliderDesc, this.rigidBody);
+    this.collider = this.world.createCollider(
+      this.colliderDesc,
+      this.rigidBody
+    );
 
     // Lock rotations
     this.rigidBody.lockRotations(true, true);
+  }
+
+  updateCapsuleCollider(targetHalfHeight) {
+    if (!this.rigidBody || !this.world || !this.collider) return;
+
+    const RAPIER = this.rapierInstance;
+    const currentPos = this.rigidBody.translation();
+    const currentHalfHeight = this.currentCapsuleHalfHeight;
+
+    // Only update if height actually changed
+    if (Math.abs(currentHalfHeight - targetHalfHeight) < 0.01) return;
+
+    // Remove old collider
+    this.world.removeCollider(this.collider, true);
+
+    // Create new collider with updated height
+    this.colliderDesc = RAPIER.ColliderDesc.capsule(
+      targetHalfHeight,
+      this.config.capsuleRadius
+    )
+      .setFriction(0.5)
+      .setRestitution(0);
+
+    this.collider = this.world.createCollider(
+      this.colliderDesc,
+      this.rigidBody
+    );
+
+    // Update tracked height
+    this.currentCapsuleHalfHeight = targetHalfHeight;
+
+    // Adjust rigid body position to account for height change
+    // Keep the bottom of the capsule at the same level
+    // When capsule shrinks: old bottom = Y - currentHalfHeight, new bottom should be same
+    // So new center = (Y - currentHalfHeight) + targetHalfHeight = Y - (currentHalfHeight - targetHalfHeight)
+    // Therefore we move DOWN by (currentHalfHeight - targetHalfHeight)
+    const heightDiff = currentHalfHeight - targetHalfHeight;
+    this.rigidBody.setTranslation(
+      {
+        x: currentPos.x,
+        y: currentPos.y - heightDiff, // Move DOWN when capsule shrinks
+        z: currentPos.z,
+      },
+      true
+    );
+
+    // Adjust character model visual offset to match capsule height change
+    // Since rigid body moves DOWN when capsule shrinks, character model needs to move UP
+    // relative to capsule center to keep character's feet at the same ground level
+    const heightChange = currentHalfHeight - targetHalfHeight;
+
+    // When capsule shrinks (heightChange > 0), rigid body moves down, so character offset moves up
+    // When capsule grows (heightChange < 0), rigid body moves up, so character offset moves down
+    this.currentCharacterYOffset = this.currentCharacterYOffset + heightChange;
+
+    if (this.animationGroup) {
+      this.animationGroup.position.y = this.currentCharacterYOffset;
+    }
   }
 
   checkGroundedRapier() {
@@ -495,9 +583,9 @@ export class CharacterController {
 
     const RAPIER = this.rapierInstance;
     const position = this.rigidBody.translation();
-    const currentHalfHeight = this.isCrouching
-      ? (this.config.capsuleHeight * 0.5) / 2
-      : this.config.capsuleHeight / 2;
+
+    // Use tracked current half height (updated by updateCapsuleCollider)
+    const currentHalfHeight = this.currentCapsuleHalfHeight;
 
     const rayOrigin = {
       x: position.x,
@@ -659,13 +747,19 @@ export class CharacterController {
     return this.normalizeAngle(start + (end - start) * t);
   }
 
-  update(delta) {
+  update(delta, interpolationAlpha = 0) {
     if (!this.rigidBody) return;
 
     // Update animation mixer
     if (this.mixer) {
       this.mixer.update(delta);
     }
+
+    // Animation change cooldown
+    this.animationChangeCooldown = Math.max(
+      this.animationChangeCooldown - delta,
+      0
+    );
 
     // Footstep cooldown
     this.footstepCooldown = Math.max(this.footstepCooldown - delta, 0);
@@ -753,6 +847,10 @@ export class CharacterController {
       this.jumpPhase = "none";
       this.setAnimation("roll");
 
+      // Update capsule to rolling height (lower, more like a sphere)
+      const rollHalfHeight = this.config.capsuleRadius; // Same as radius for rolling
+      this.updateCapsuleCollider(rollHalfHeight);
+
       const rollSpeed = this.config.RUN_SPEED * 1.2;
       const facingRotation = this.rotationTarget + this.characterRotationTarget;
       vel.x = Math.sin(facingRotation) * rollSpeed;
@@ -760,6 +858,9 @@ export class CharacterController {
 
       setTimeout(() => {
         this.isRolling = false;
+        // Restore capsule to standing height when roll ends
+        const standingHalfHeight = this.config.capsuleHeight / 2;
+        this.updateCapsuleCollider(standingHalfHeight);
       }, 800);
     } else if (!this.keys.roll) {
       this.rollPressed = false;
@@ -790,10 +891,8 @@ export class CharacterController {
 
     // Update capsule on crouch state change
     if (shouldBeCrouched !== this.isCrouching) {
-      const currentPos = this.rigidBody.translation();
       const standingHalfHeight = this.config.capsuleHeight / 2;
       const crouchHalfHeight = (this.config.capsuleHeight * 0.5) / 2;
-      const heightDiff = standingHalfHeight - crouchHalfHeight;
 
       this.crouchTransitioning = true;
       this.jumpPhase = "none";
@@ -803,23 +902,11 @@ export class CharacterController {
       }, 200);
 
       if (shouldBeCrouched) {
-        this.rigidBody.setTranslation(
-          {
-            x: currentPos.x,
-            y: currentPos.y - heightDiff,
-            z: currentPos.z,
-          },
-          true
-        );
+        // Update capsule to crouch height
+        this.updateCapsuleCollider(crouchHalfHeight);
       } else {
-        this.rigidBody.setTranslation(
-          {
-            x: currentPos.x,
-            y: currentPos.y + heightDiff,
-            z: currentPos.z,
-          },
-          true
-        );
+        // Update capsule to standing height
+        this.updateCapsuleCollider(standingHalfHeight);
         this.setAnimation("idle");
       }
 
@@ -888,10 +975,11 @@ export class CharacterController {
         this.jumpPressed = false;
       }
 
-      // Movement animations
+      // Movement animations - only if not jumping and not in any jump phase
+      const isInJumpPhase = this.jumpPhase !== "none";
       if (
         grounded &&
-        this.jumpPhase === "none" &&
+        !isInJumpPhase &&
         !this.keys.dance &&
         !this.isAttacking &&
         !this.isRolling
@@ -936,10 +1024,11 @@ export class CharacterController {
         this.jumpPressed = false;
       }
 
-      // Idle animations
+      // Idle animations - only if not jumping and not in any jump phase
+      const isInJumpPhaseIdle = this.jumpPhase !== "none";
       if (
         grounded &&
-        this.jumpPhase === "none" &&
+        !isInJumpPhaseIdle &&
         !this.keys.dance &&
         !this.isAttacking &&
         !this.isRolling
@@ -971,9 +1060,33 @@ export class CharacterController {
     // Update velocity
     this.rigidBody.setLinvel(vel, true);
 
-    // Update position
+    // Update position with interpolation for smooth rendering
     const position = this.rigidBody.translation();
-    this.container.position.set(position.x, position.y, position.z);
+
+    // Store current physics position (after physics step)
+    this.currentPosition.set(position.x, position.y, position.z);
+
+    // Interpolate between previous and current physics position
+    // This smooths out the visual representation between physics steps
+    // interpolationAlpha (0-1) represents how far we are between the last physics step and the next
+    // Since we're called after physics step, we interpolate between prevPosition (before step) and currentPosition (after step)
+    if (this.prevPosition.lengthSq() === 0) {
+      // First frame: initialize previous position
+      this.prevPosition.copy(this.currentPosition);
+      this.container.position.copy(this.currentPosition);
+    } else {
+      // Interpolate: lerp from previous position (before physics step) to current position (after physics step)
+      // Alpha tells us how much of the way we are between physics steps
+      this.container.position.lerpVectors(
+        this.prevPosition,
+        this.currentPosition,
+        interpolationAlpha
+      );
+    }
+
+    // At the end of the frame, store current position as previous for next frame
+    // This becomes the "before physics step" position for the next frame
+    this.prevPosition.copy(this.currentPosition);
 
     // Camera update
     if (this.cameraMode === "follow" || this.cameraMode === "follow-orbit") {
