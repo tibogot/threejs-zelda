@@ -1,0 +1,1046 @@
+// CharacterController.js
+import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
+import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
+
+export class CharacterController {
+  constructor(scene, world, camera, collider = null, rapierInstance = null) {
+    if (!rapierInstance) {
+      throw new Error(
+        "CharacterController requires a RAPIER instance to be passed. Use PhysicsManager.getRAPIER()"
+      );
+    }
+
+    this.scene = scene;
+    this.world = world;
+    this.camera = camera;
+    this.collider = collider; // BVH mesh for ground detection
+    this.rapierInstance = rapierInstance; // Use provided RAPIER instance from PhysicsManager
+
+    // Configuration
+    this.config = {
+      WALK_SPEED: 1.8,
+      RUN_SPEED: 4,
+      ROTATION_SPEED: THREE.MathUtils.degToRad(0.5),
+      JUMP_FORCE: 6,
+      cameraX: 0,
+      cameraY: 1.5,
+      cameraZ: -5.6,
+      targetZ: 5,
+      cameraLerpSpeed: 0.1,
+      mouseSensitivity: 0.003,
+      capsuleHeight: 1.4,
+      capsuleRadius: 0.3,
+      yPosition: -0.99,
+      characterScale: 1,
+      enableFootstepAudio: true,
+      enableFootstepParticles: true,
+    };
+
+    // Physics body
+    this.rigidBody = null;
+    this.colliderDesc = null;
+
+    // Character groups
+    this.container = new THREE.Group();
+    this.character = new THREE.Group();
+    this.animationGroup = new THREE.Group();
+    this.cameraTarget = new THREE.Group();
+    this.cameraPosition = new THREE.Group();
+
+    // Setup hierarchy
+    this.character.add(this.animationGroup);
+    this.container.add(this.character);
+    this.container.add(this.cameraTarget);
+    this.container.add(this.cameraPosition);
+    this.scene.add(this.container);
+
+    // Position camera helpers
+    this.cameraTarget.position.z = this.config.targetZ;
+    this.cameraPosition.position.set(
+      this.config.cameraX,
+      this.config.cameraY,
+      this.config.cameraZ
+    );
+
+    // Animation
+    this.mixer = null;
+    this.actions = {};
+    this.currentAnimation = "idle";
+    this.currentAction = null;
+
+    // State
+    this.isGrounded = true;
+    this.wasGrounded = false;
+    this.jumpPhase = "none"; // 'none' | 'start' | 'loop' | 'land'
+    this.combatMode = false;
+    this.isAttacking = false;
+    this.isRolling = false;
+    this.isCrouching = false;
+    this.crouchTransitioning = false;
+    this.ceilingClearanceTimer = -1;
+
+    // Rotation
+    this.characterRotationTarget = 0;
+    this.rotationTarget = 0;
+
+    // Camera
+    this.cameraMode = "follow-orbit"; // 'follow' | 'follow-orbit' | 'orbit'
+    this.cameraWorldPosition = new THREE.Vector3();
+    this.cameraLookAtWorldPosition = new THREE.Vector3();
+    this.cameraLookAt = new THREE.Vector3();
+    this.cameraInitialized = false;
+    this.mouseOrbitOffset = 0;
+    this.mouseVerticalOffset = 0;
+    this.isPointerLocked = false;
+
+    // Input
+    this.keys = {
+      forward: false,
+      backward: false,
+      left: false,
+      right: false,
+      run: false,
+      jump: false,
+      crouch: false,
+      dance: false,
+      roll: false,
+      walkBackward: false,
+    };
+    this.jumpPressed = false;
+    this.rollPressed = false;
+
+    // Footstep system
+    this.leftFootBone = null;
+    this.rightFootBone = null;
+    this.leftFootWorldPosition = new THREE.Vector3();
+    this.rightFootWorldPosition = new THREE.Vector3();
+    this.prevLeftFootPosition = new THREE.Vector3();
+    this.prevRightFootPosition = new THREE.Vector3();
+    this.leftFootInitialized = false;
+    this.rightFootInitialized = false;
+    this.leftFootWasGrounded = false;
+    this.rightFootWasGrounded = false;
+    this.footstepCooldown = 0;
+    this.lastFootstepIndex = null;
+    this.leftFootPrevToi = 1;
+    this.rightFootPrevToi = 1;
+
+    this.footstepAnimations = new Set([
+      "walk",
+      "run",
+      "walkBackwards",
+      "crouchWalk",
+    ]);
+    this.footstepSoundPaths = [
+      "/sounds/steps.mp3",
+      "/sounds/steps (2).mp3",
+      "/sounds/steps (3).mp3",
+      "/sounds/steps (5).mp3",
+    ];
+
+    // BVH temps
+    this.tempBox = new THREE.Box3();
+    this.tempMat = new THREE.Matrix4();
+    this.tempSegment = new THREE.Line3();
+    this.tempVector = new THREE.Vector3();
+    this.tempVector2 = new THREE.Vector3();
+    this.tempLandingCenter = new THREE.Vector3();
+    this.tempLandingNormal = new THREE.Vector3(0, 1, 0);
+
+    // Animation mapping
+    this.animationMap = {
+      idle: "Idle_Loop",
+      walk: "Walk_Loop",
+      run: "Sprint_Loop",
+      walkBackwards: "Walk_Loop",
+      leftTurn: "Walk_Loop",
+      rightTurn: "Walk_Loop",
+      dance: "Dance_Loop",
+      jumpStart: "Jump_Start",
+      jumpLoop: "Jump_Loop",
+      jumpLand: "Jump_Land",
+      crouchIdle: "Crouch_Idle_Loop",
+      crouchWalk: "Crouch_Fwd_Loop",
+      swordIdle: "Sword_Idle",
+      swordAttack: "Sword_Attack",
+      swordAttackAlt: "Sword_Attack_RM",
+      roll: "Roll",
+    };
+
+    // Bind methods
+    this.update = this.update.bind(this);
+    this.handleKeyDown = this.handleKeyDown.bind(this);
+    this.handleKeyUp = this.handleKeyUp.bind(this);
+    this.handleMouseDown = this.handleMouseDown.bind(this);
+    this.handleContextMenu = this.handleContextMenu.bind(this);
+    this.handleMouseMove = this.handleMouseMove.bind(this);
+    this.handlePointerLockChange = this.handlePointerLockChange.bind(this);
+    this.handleClick = this.handleClick.bind(this);
+
+    // Setup input listeners
+    this.setupInputListeners();
+
+    // Load model
+    this.loadModel();
+  }
+
+  setupInputListeners() {
+    // Keyboard
+    window.addEventListener("keydown", this.handleKeyDown);
+    window.addEventListener("keyup", this.handleKeyUp);
+
+    // Mouse
+    window.addEventListener("mousedown", this.handleMouseDown);
+    window.addEventListener("contextmenu", this.handleContextMenu);
+    window.addEventListener("mousemove", this.handleMouseMove);
+
+    // Pointer lock
+    document.addEventListener(
+      "pointerlockchange",
+      this.handlePointerLockChange
+    );
+
+    // Canvas click for pointer lock
+    const canvas = document.querySelector("canvas");
+    if (canvas) {
+      canvas.addEventListener("click", this.handleClick);
+    }
+  }
+
+  handleClick() {
+    if (this.cameraMode === "follow-orbit" && !this.isPointerLocked) {
+      const canvas = document.querySelector("canvas");
+      if (canvas) {
+        canvas.requestPointerLock();
+      }
+    }
+  }
+
+  handleKeyDown(e) {
+    switch (e.key.toLowerCase()) {
+      case "w":
+      case "z":
+        this.keys.forward = true;
+        break;
+      case "s":
+        this.keys.backward = true;
+        break;
+      case "a":
+      case "q":
+        this.keys.left = true;
+        break;
+      case "d":
+        this.keys.right = true;
+        break;
+      case "shift":
+        this.keys.run = true;
+        break;
+      case " ":
+        this.keys.jump = true;
+        break;
+      case "control":
+        this.keys.crouch = true;
+        break;
+      case "e":
+        this.keys.dance = true;
+        break;
+      case "alt":
+        this.keys.roll = true;
+        break;
+      case "r":
+        this.combatMode = !this.combatMode;
+        break;
+    }
+  }
+
+  handleKeyUp(e) {
+    switch (e.key.toLowerCase()) {
+      case "w":
+      case "z":
+        this.keys.forward = false;
+        break;
+      case "s":
+        this.keys.backward = false;
+        break;
+      case "a":
+      case "q":
+        this.keys.left = false;
+        break;
+      case "d":
+        this.keys.right = false;
+        break;
+      case "shift":
+        this.keys.run = false;
+        break;
+      case " ":
+        this.keys.jump = false;
+        break;
+      case "control":
+        this.keys.crouch = false;
+        break;
+      case "e":
+        this.keys.dance = false;
+        break;
+      case "alt":
+        this.keys.roll = false;
+        break;
+    }
+  }
+
+  handleMouseDown(e) {
+    if (!this.combatMode || this.isAttacking) return;
+
+    this.isAttacking = true;
+
+    if (e.button === 0) {
+      this.setAnimation("swordAttack");
+      setTimeout(() => {
+        this.isAttacking = false;
+      }, 600);
+    } else if (e.button === 2) {
+      this.setAnimation("swordAttackAlt");
+      setTimeout(() => {
+        this.isAttacking = false;
+      }, 600);
+    }
+  }
+
+  handleContextMenu(e) {
+    if (this.combatMode) {
+      e.preventDefault();
+    }
+  }
+
+  handleMouseMove(e) {
+    if (this.cameraMode !== "follow-orbit" || !this.isPointerLocked) return;
+
+    const deltaX = e.movementX || 0;
+    const deltaY = e.movementY || 0;
+
+    this.mouseOrbitOffset -= deltaX * this.config.mouseSensitivity;
+    this.mouseVerticalOffset -= deltaY * this.config.mouseSensitivity;
+
+    this.mouseVerticalOffset = THREE.MathUtils.clamp(
+      this.mouseVerticalOffset,
+      -Math.PI / 3,
+      Math.PI / 3
+    );
+  }
+
+  handlePointerLockChange() {
+    const canvas = document.querySelector("canvas");
+    this.isPointerLocked = document.pointerLockElement === canvas;
+    document.body.style.cursor = this.isPointerLocked ? "none" : "auto";
+  }
+
+  async loadModel() {
+    // Setup DRACO loader for compressed models
+    const dracoLoader = new DRACOLoader();
+    // Use CDN for draco decoder (works with Vite)
+    dracoLoader.setDecoderPath(
+      "https://www.gstatic.com/draco/versioned/decoders/1.5.7/"
+    );
+
+    const loader = new GLTFLoader();
+    loader.setDRACOLoader(dracoLoader);
+
+    try {
+      const gltf = await loader.loadAsync(
+        "/models/AnimationLibrary_Godot_Standard-transformed.glb"
+      );
+
+      // Clone scene with skeleton
+      const clonedScene = SkeletonUtils.clone(gltf.scene);
+
+      // Find meshes and setup
+      clonedScene.traverse((child) => {
+        if (child.isMesh) {
+          child.castShadow = true;
+          child.receiveShadow = true;
+          child.frustumCulled = false;
+        }
+      });
+
+      // Add to animation group
+      this.animationGroup.add(clonedScene);
+      this.animationGroup.position.y = this.config.yPosition;
+      this.animationGroup.scale.setScalar(this.config.characterScale);
+
+      // Setup animations
+      this.mixer = new THREE.AnimationMixer(clonedScene);
+
+      gltf.animations.forEach((clip) => {
+        const action = this.mixer.clipAction(clip);
+        this.actions[clip.name] = action;
+      });
+
+      // Find foot bones
+      this.findFootBones(clonedScene);
+
+      // Start with idle
+      this.setAnimation("idle");
+
+      console.log("Character model loaded successfully");
+    } catch (error) {
+      console.error("Error loading character model:", error);
+    }
+  }
+
+  findFootBones(scene) {
+    const leftFootCandidates = [
+      "mixamorigLeftFoot",
+      "mixamorig_LeftFoot",
+      "LeftFoot",
+      "DEF-footL",
+    ];
+    const rightFootCandidates = [
+      "mixamorigRightFoot",
+      "mixamorig_RightFoot",
+      "RightFoot",
+      "DEF-footR",
+    ];
+
+    scene.traverse((node) => {
+      if (node.isBone) {
+        const nameLower = node.name.toLowerCase();
+
+        if (
+          leftFootCandidates.some((c) => nameLower.includes(c.toLowerCase()))
+        ) {
+          this.leftFootBone = node;
+        }
+        if (
+          rightFootCandidates.some((c) => nameLower.includes(c.toLowerCase()))
+        ) {
+          this.rightFootBone = node;
+        }
+      }
+    });
+
+    if (this.leftFootBone)
+      console.log("Found left foot bone:", this.leftFootBone.name);
+    if (this.rightFootBone)
+      console.log("Found right foot bone:", this.rightFootBone.name);
+  }
+
+  setAnimation(animName) {
+    if (this.currentAnimation === animName) return;
+
+    const mappedName = this.animationMap[animName] || this.animationMap.idle;
+    const nextAction = this.actions[mappedName];
+
+    if (!nextAction) {
+      console.warn(`Animation ${mappedName} not found`);
+      return;
+    }
+
+    if (this.currentAction) {
+      this.currentAction.fadeOut(0.2);
+    }
+
+    nextAction
+      .reset()
+      .setEffectiveTimeScale(1)
+      .setEffectiveWeight(1)
+      .fadeIn(0.2)
+      .play();
+
+    this.currentAction = nextAction;
+    this.currentAnimation = animName;
+  }
+
+  createPhysicsBody(position = [0, 2, 0]) {
+    if (!this.world) return;
+
+    // Use the RAPIER instance (either passed in or imported)
+    const RAPIER = this.rapierInstance;
+
+    // Create rigid body
+    const rigidBodyDesc = RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(...position)
+      .setCanSleep(false)
+      .setCcdEnabled(true);
+
+    this.rigidBody = this.world.createRigidBody(rigidBodyDesc);
+
+    // Create capsule collider
+    const halfHeight = this.config.capsuleHeight / 2;
+    this.colliderDesc = RAPIER.ColliderDesc.capsule(
+      halfHeight,
+      this.config.capsuleRadius
+    )
+      .setFriction(0.5)
+      .setRestitution(0);
+
+    this.world.createCollider(this.colliderDesc, this.rigidBody);
+
+    // Lock rotations
+    this.rigidBody.lockRotations(true, true);
+  }
+
+  checkGroundedRapier() {
+    if (!this.rigidBody || !this.world) return false;
+
+    const RAPIER = this.rapierInstance;
+    const position = this.rigidBody.translation();
+    const currentHalfHeight = this.isCrouching
+      ? (this.config.capsuleHeight * 0.5) / 2
+      : this.config.capsuleHeight / 2;
+
+    const rayOrigin = {
+      x: position.x,
+      y: position.y - currentHalfHeight - this.config.capsuleRadius + 0.05,
+      z: position.z,
+    };
+    const rayDirection = { x: 0, y: -1, z: 0 };
+    const rayLength = 0.2;
+
+    const ray = new RAPIER.Ray(rayOrigin, rayDirection);
+    const hit = this.world.castRay(
+      ray,
+      rayLength,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      this.rigidBody
+    );
+
+    if (hit) {
+      const hitToi = hit.toi ?? hit.timeOfImpact ?? hit.time_of_impact;
+      return typeof hitToi === "number" && hitToi <= rayLength;
+    }
+
+    return false;
+  }
+
+  checkCeilingClearance() {
+    if (!this.rigidBody || !this.world) return true;
+
+    const RAPIER = this.rapierInstance;
+    const position = this.rigidBody.translation();
+    const crouchHalfHeight = (this.config.capsuleHeight * 0.5) / 2;
+    const standingHalfHeight = this.config.capsuleHeight / 2;
+
+    const rayOrigin = {
+      x: position.x,
+      y: position.y + crouchHalfHeight + this.config.capsuleRadius,
+      z: position.z,
+    };
+    const rayDirection = { x: 0, y: 1, z: 0 };
+    const safetyBuffer = 0.5;
+    const rayLength = standingHalfHeight - crouchHalfHeight + safetyBuffer;
+
+    const ray = new RAPIER.Ray(rayOrigin, rayDirection);
+    const hit = this.world.castRay(
+      ray,
+      rayLength,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      this.rigidBody
+    );
+
+    return !hit;
+  }
+
+  castFootRay(position) {
+    if (!this.world || !this.rigidBody) return null;
+
+    const RAPIER = this.rapierInstance;
+    const rayOrigin = {
+      x: position.x,
+      y: position.y + 0.05,
+      z: position.z,
+    };
+    const rayDirection = { x: 0, y: -1, z: 0 };
+    const rayLength = 0.35;
+
+    try {
+      const ray = new RAPIER.Ray(rayOrigin, rayDirection);
+      const hit = this.world.castRayAndGetNormal(
+        ray,
+        rayLength,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        this.rigidBody
+      );
+
+      if (hit) {
+        const hitToi = hit.toi ?? hit.timeOfImpact ?? hit.time_of_impact;
+
+        if (typeof hitToi === "number" && hitToi <= rayLength) {
+          const point = new THREE.Vector3(
+            rayOrigin.x + rayDirection.x * hitToi,
+            rayOrigin.y + rayDirection.y * hitToi,
+            rayOrigin.z + rayDirection.z * hitToi
+          );
+
+          const hitNormal = hit.normal ?? hit.normal1 ?? hit.normal2;
+          const normal = hitNormal
+            ? new THREE.Vector3(hitNormal.x, hitNormal.y, hitNormal.z)
+            : new THREE.Vector3().copy(this.tempLandingNormal);
+
+          const slopeFactor = normal
+            ? 1 - Math.max(0, Math.min(1, normal.y))
+            : 0;
+
+          return { position: point, normal, slopeFactor, hitToi };
+        }
+      }
+
+      return null;
+    } catch (error) {
+      console.warn("Footstep raycast error:", error);
+      return null;
+    }
+  }
+
+  playFootstepSound() {
+    if (
+      !this.config.enableFootstepAudio ||
+      this.footstepSoundPaths.length === 0
+    ) {
+      return;
+    }
+
+    let chosenIndex;
+    if (this.footstepSoundPaths.length === 1) {
+      chosenIndex = 0;
+    } else {
+      let attempts = 0;
+      do {
+        chosenIndex = Math.floor(
+          Math.random() * this.footstepSoundPaths.length
+        );
+        attempts++;
+      } while (chosenIndex === this.lastFootstepIndex && attempts < 5);
+    }
+
+    this.lastFootstepIndex = chosenIndex;
+    const audio = new Audio(this.footstepSoundPaths[chosenIndex]);
+    audio.volume = 0.3;
+    audio.play().catch(() => {});
+  }
+
+  normalizeAngle(angle) {
+    while (angle > Math.PI) angle -= 2 * Math.PI;
+    while (angle < -Math.PI) angle += 2 * Math.PI;
+    return angle;
+  }
+
+  lerpAngle(start, end, t) {
+    start = this.normalizeAngle(start);
+    end = this.normalizeAngle(end);
+
+    if (Math.abs(end - start) > Math.PI) {
+      if (end > start) {
+        start += 2 * Math.PI;
+      } else {
+        end += 2 * Math.PI;
+      }
+    }
+
+    return this.normalizeAngle(start + (end - start) * t);
+  }
+
+  update(delta) {
+    if (!this.rigidBody) return;
+
+    // Update animation mixer
+    if (this.mixer) {
+      this.mixer.update(delta);
+    }
+
+    // Footstep cooldown
+    this.footstepCooldown = Math.max(this.footstepCooldown - delta, 0);
+
+    const vel = this.rigidBody.linvel();
+    if (!vel) return;
+
+    // Ground detection
+    let grounded = this.checkGroundedRapier();
+
+    if (this.crouchTransitioning) {
+      grounded = true;
+    }
+
+    this.isGrounded = grounded;
+
+    // Crouch logic
+    const hasCeilingClearance = this.isCrouching
+      ? this.checkCeilingClearance()
+      : true;
+
+    if (this.keys.crouch) {
+      this.ceilingClearanceTimer = -1;
+    } else if (!hasCeilingClearance && this.isCrouching) {
+      this.ceilingClearanceTimer = 0;
+    } else if (
+      hasCeilingClearance &&
+      this.isCrouching &&
+      this.ceilingClearanceTimer >= 0
+    ) {
+      this.ceilingClearanceTimer += delta;
+    } else if (!this.isCrouching) {
+      this.ceilingClearanceTimer = -1;
+    }
+
+    const standUpDelay = 0.5;
+    let shouldBeCrouched;
+
+    if (this.keys.crouch) {
+      shouldBeCrouched = true;
+      this.ceilingClearanceTimer = -1;
+    } else if (!hasCeilingClearance) {
+      shouldBeCrouched = true;
+    } else if (
+      this.ceilingClearanceTimer >= 0 &&
+      this.ceilingClearanceTimer < standUpDelay
+    ) {
+      shouldBeCrouched = true;
+    } else {
+      shouldBeCrouched = false;
+    }
+
+    // Landing detection
+    if (!this.wasGrounded && grounded) {
+      this.jumpPhase = "land";
+      this.setAnimation("jumpLand");
+
+      vel.x *= 0.2;
+      vel.z *= 0.2;
+
+      if (this.footstepCooldown <= 0.05) {
+        this.playFootstepSound();
+        this.footstepCooldown = 0.25;
+      }
+
+      setTimeout(() => {
+        if (this.jumpPhase === "land") {
+          this.jumpPhase = "none";
+        }
+      }, 300);
+    }
+
+    // Roll input
+    if (
+      this.keys.roll &&
+      !this.rollPressed &&
+      grounded &&
+      !shouldBeCrouched &&
+      !this.keys.dance &&
+      !this.isAttacking &&
+      !this.isRolling
+    ) {
+      this.rollPressed = true;
+      this.isRolling = true;
+      this.jumpPhase = "none";
+      this.setAnimation("roll");
+
+      const rollSpeed = this.config.RUN_SPEED * 1.2;
+      const facingRotation = this.rotationTarget + this.characterRotationTarget;
+      vel.x = Math.sin(facingRotation) * rollSpeed;
+      vel.z = Math.cos(facingRotation) * rollSpeed;
+
+      setTimeout(() => {
+        this.isRolling = false;
+      }, 800);
+    } else if (!this.keys.roll) {
+      this.rollPressed = false;
+    }
+
+    // Falling detection
+    if (
+      !grounded &&
+      this.jumpPhase === "none" &&
+      !shouldBeCrouched &&
+      !this.crouchTransitioning &&
+      !this.isRolling
+    ) {
+      this.jumpPhase = "loop";
+      this.setAnimation("jumpLoop");
+    }
+
+    this.wasGrounded = grounded;
+
+    const movement = { x: 0, z: 0, walkBackwardMode: false };
+
+    // Dance
+    if (this.keys.dance) {
+      this.setAnimation("dance");
+      movement.x = 0;
+      movement.z = 0;
+    }
+
+    // Update capsule on crouch state change
+    if (shouldBeCrouched !== this.isCrouching) {
+      const currentPos = this.rigidBody.translation();
+      const standingHalfHeight = this.config.capsuleHeight / 2;
+      const crouchHalfHeight = (this.config.capsuleHeight * 0.5) / 2;
+      const heightDiff = standingHalfHeight - crouchHalfHeight;
+
+      this.crouchTransitioning = true;
+      this.jumpPhase = "none";
+
+      setTimeout(() => {
+        this.crouchTransitioning = false;
+      }, 200);
+
+      if (shouldBeCrouched) {
+        this.rigidBody.setTranslation(
+          {
+            x: currentPos.x,
+            y: currentPos.y - heightDiff,
+            z: currentPos.z,
+          },
+          true
+        );
+      } else {
+        this.rigidBody.setTranslation(
+          {
+            x: currentPos.x,
+            y: currentPos.y + heightDiff,
+            z: currentPos.z,
+          },
+          true
+        );
+        this.setAnimation("idle");
+      }
+
+      this.isCrouching = shouldBeCrouched;
+    }
+
+    // Movement input
+    if (this.keys.forward) movement.z = 1;
+    if (this.keys.backward) movement.z = -1;
+    if (this.keys.left) movement.x = 1;
+    if (this.keys.right) movement.x = -1;
+
+    if (movement.x !== 0) {
+      this.rotationTarget += this.config.ROTATION_SPEED * movement.x;
+    }
+
+    // Speed
+    let speed = this.keys.run ? this.config.RUN_SPEED : this.config.WALK_SPEED;
+    if (shouldBeCrouched) {
+      speed = this.config.WALK_SPEED * 0.5;
+    }
+
+    if (movement.x !== 0 || movement.z !== 0) {
+      const baseMovementAngle = movement.walkBackwardMode
+        ? Math.atan2(movement.x, 1)
+        : Math.atan2(movement.x, movement.z);
+
+      const movementRotation = this.rotationTarget + baseMovementAngle;
+
+      let intendedVelX = Math.sin(movementRotation) * speed;
+      let intendedVelZ = Math.cos(movementRotation) * speed;
+
+      if (movement.walkBackwardMode) {
+        this.characterRotationTarget = Math.atan2(movement.x, 1);
+      } else {
+        this.characterRotationTarget = Math.atan2(movement.x, movement.z);
+      }
+
+      if (movement.walkBackwardMode && movement.z < 0) {
+        intendedVelX = -intendedVelX;
+        intendedVelZ = -intendedVelZ;
+      }
+
+      if (grounded && this.jumpPhase !== "land") {
+        vel.x = intendedVelX;
+        vel.z = intendedVelZ;
+      }
+
+      // Jump
+      if (this.keys.jump && grounded && !this.jumpPressed) {
+        this.jumpPressed = true;
+        vel.y = this.config.JUMP_FORCE;
+        vel.x = intendedVelX;
+        vel.z = intendedVelZ;
+
+        this.jumpPhase = "start";
+        this.setAnimation("jumpStart");
+
+        setTimeout(() => {
+          if (this.jumpPhase === "start") {
+            this.jumpPhase = "loop";
+            this.setAnimation("jumpLoop");
+          }
+        }, 200);
+      } else if (!this.keys.jump) {
+        this.jumpPressed = false;
+      }
+
+      // Movement animations
+      if (
+        grounded &&
+        this.jumpPhase === "none" &&
+        !this.keys.dance &&
+        !this.isAttacking &&
+        !this.isRolling
+      ) {
+        if (shouldBeCrouched) {
+          this.setAnimation("crouchWalk");
+        } else if (this.combatMode) {
+          this.setAnimation("swordIdle");
+        } else if (speed === this.config.RUN_SPEED) {
+          this.setAnimation("run");
+        } else if (movement.walkBackwardMode) {
+          this.setAnimation("walkBackwards");
+        } else {
+          this.setAnimation("walk");
+        }
+      }
+    } else {
+      // No movement
+      if (grounded) {
+        vel.x *= 0.85;
+        vel.z *= 0.85;
+
+        if (Math.abs(vel.x) < 0.01) vel.x = 0;
+        if (Math.abs(vel.z) < 0.01) vel.z = 0;
+      }
+
+      // Jump standing still
+      if (this.keys.jump && grounded && !this.jumpPressed) {
+        this.jumpPressed = true;
+        vel.y = this.config.JUMP_FORCE;
+
+        this.jumpPhase = "start";
+        this.setAnimation("jumpStart");
+
+        setTimeout(() => {
+          if (this.jumpPhase === "start") {
+            this.jumpPhase = "loop";
+            this.setAnimation("jumpLoop");
+          }
+        }, 200);
+      } else if (!this.keys.jump) {
+        this.jumpPressed = false;
+      }
+
+      // Idle animations
+      if (
+        grounded &&
+        this.jumpPhase === "none" &&
+        !this.keys.dance &&
+        !this.isAttacking &&
+        !this.isRolling
+      ) {
+        if (shouldBeCrouched) {
+          this.setAnimation("crouchIdle");
+        } else if (this.combatMode) {
+          this.setAnimation("swordIdle");
+        } else {
+          this.setAnimation("idle");
+        }
+      }
+    }
+
+    // Character rotation
+    if (this.character) {
+      let targetRotation = this.characterRotationTarget;
+      if (this.cameraMode === "follow-orbit") {
+        targetRotation = this.characterRotationTarget - this.mouseOrbitOffset;
+      }
+
+      this.character.rotation.y = this.lerpAngle(
+        this.character.rotation.y,
+        targetRotation,
+        0.1
+      );
+    }
+
+    // Update velocity
+    this.rigidBody.setLinvel(vel, true);
+
+    // Update position
+    const position = this.rigidBody.translation();
+    this.container.position.set(position.x, position.y, position.z);
+
+    // Camera update
+    if (this.cameraMode === "follow" || this.cameraMode === "follow-orbit") {
+      const baseRotation = this.rotationTarget;
+      const finalRotation =
+        this.cameraMode === "follow-orbit"
+          ? baseRotation + this.mouseOrbitOffset
+          : baseRotation;
+
+      this.container.rotation.y = THREE.MathUtils.lerp(
+        this.container.rotation.y,
+        finalRotation,
+        this.config.cameraLerpSpeed
+      );
+
+      this.cameraPosition.getWorldPosition(this.cameraWorldPosition);
+
+      const isFirstFrame = !this.cameraInitialized;
+
+      if (isFirstFrame) {
+        this.camera.position.copy(this.cameraWorldPosition);
+      } else {
+        this.camera.position.lerp(
+          this.cameraWorldPosition,
+          this.config.cameraLerpSpeed
+        );
+      }
+
+      this.cameraTarget.getWorldPosition(this.cameraLookAtWorldPosition);
+
+      if (isFirstFrame) {
+        this.cameraLookAt.copy(this.cameraLookAtWorldPosition);
+      } else {
+        this.cameraLookAt.lerp(
+          this.cameraLookAtWorldPosition,
+          this.config.cameraLerpSpeed
+        );
+      }
+
+      if (this.cameraMode === "follow-orbit") {
+        const verticalRotationOffset = Math.sin(this.mouseVerticalOffset) * 2;
+        this.cameraLookAt.y =
+          this.cameraLookAtWorldPosition.y + verticalRotationOffset;
+      }
+
+      this.camera.lookAt(this.cameraLookAt);
+
+      if (isFirstFrame) {
+        this.cameraInitialized = true;
+      }
+    }
+  }
+
+  dispose() {
+    window.removeEventListener("keydown", this.handleKeyDown);
+    window.removeEventListener("keyup", this.handleKeyUp);
+    window.removeEventListener("mousedown", this.handleMouseDown);
+    window.removeEventListener("contextmenu", this.handleContextMenu);
+    window.removeEventListener("mousemove", this.handleMouseMove);
+    document.removeEventListener(
+      "pointerlockchange",
+      this.handlePointerLockChange
+    );
+
+    const canvas = document.querySelector("canvas");
+    if (canvas) {
+      canvas.removeEventListener("click", this.handleClick);
+    }
+
+    if (this.mixer) {
+      this.mixer.stopAllAction();
+    }
+
+    if (this.rigidBody && this.world) {
+      this.world.removeRigidBody(this.rigidBody);
+    }
+
+    this.scene.remove(this.container);
+  }
+}
