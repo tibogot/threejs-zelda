@@ -3,6 +3,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
+import { FootstepParticles } from "../effects/FootstepParticles";
 
 export class CharacterController {
   constructor(scene, world, camera, collider = null, rapierInstance = null) {
@@ -88,6 +89,8 @@ export class CharacterController {
     this.isCrouching = false;
     this.crouchTransitioning = false;
     this.ceilingClearanceTimer = -1;
+    this.rollDirection = undefined;
+    this.rollSpeed = undefined;
 
     // Rotation
     this.characterRotationTarget = 0;
@@ -134,6 +137,9 @@ export class CharacterController {
     this.lastFootstepIndex = null;
     this.leftFootPrevToi = 1;
     this.rightFootPrevToi = 1;
+
+    // Footstep particles
+    this.footstepParticles = null;
 
     this.footstepAnimations = new Set([
       "walk",
@@ -401,6 +407,11 @@ export class CharacterController {
 
       // Start with idle
       this.setAnimation("idle");
+
+      // Initialize footstep particles
+      if (this.config.enableFootstepParticles) {
+        this.footstepParticles = new FootstepParticles(this.scene);
+      }
 
       console.log("Character model loaded successfully");
     } catch (error) {
@@ -679,16 +690,21 @@ export class CharacterController {
             rayOrigin.z + rayDirection.z * hitToi
           );
 
-          const hitNormal = hit.normal ?? hit.normal1 ?? hit.normal2;
-          const normal = hitNormal
-            ? new THREE.Vector3(hitNormal.x, hitNormal.y, hitNormal.z)
-            : new THREE.Vector3().copy(this.tempLandingNormal);
+          // Get normal for slope calculation
+          const hitNormal = hit.normal ?? hit.normal1 ?? hit.normal2 ?? null;
+          let normal = new THREE.Vector3(0, 1, 0);
+          if (hitNormal) {
+            normal.set(hitNormal.x, hitNormal.y, hitNormal.z);
+          }
 
-          const slopeFactor = normal
-            ? 1 - Math.max(0, Math.min(1, normal.y))
-            : 0;
+          const slopeFactor = 1 - Math.max(0, Math.min(1, normal.y));
 
-          return { position: point, normal, slopeFactor, hitToi };
+          return {
+            hitToi,
+            slopeFactor,
+            point,
+            normal,
+          };
         }
       }
 
@@ -699,7 +715,7 @@ export class CharacterController {
     }
   }
 
-  playFootstepSound() {
+  playFootstepSound(volumeMultiplier = 1.0) {
     if (
       !this.config.enableFootstepAudio ||
       this.footstepSoundPaths.length === 0
@@ -722,8 +738,182 @@ export class CharacterController {
 
     this.lastFootstepIndex = chosenIndex;
     const audio = new Audio(this.footstepSoundPaths[chosenIndex]);
-    audio.volume = 0.3;
+    audio.volume = 0.3 * volumeMultiplier;
     audio.play().catch(() => {});
+  }
+
+  updateFootsteps(delta) {
+    // Only check footsteps during movement animations
+    if (
+      !this.footstepAnimations.has(this.currentAnimation) ||
+      !this.isGrounded ||
+      this.jumpPhase !== "none" ||
+      this.isRolling
+    ) {
+      return;
+    }
+
+    // Get current speed to adjust footstep rate
+    const vel = this.rigidBody.linvel();
+    const horizontalSpeed = Math.sqrt(vel.x * vel.x + vel.z * vel.z);
+    const isRunning = horizontalSpeed > this.config.WALK_SPEED * 1.5;
+
+    // Adjust cooldown based on speed (faster = shorter cooldown)
+    // For running, use a longer cooldown to prevent too many sounds
+    const baseCooldown = isRunning ? 0.2 : 0.25;
+    const speedFactor = Math.min(horizontalSpeed / this.config.RUN_SPEED, 1.5);
+    const adjustedCooldown = baseCooldown / Math.max(speedFactor, 0.5);
+
+    // Ensure minimum cooldown to prevent rapid fire sounds
+    const minCooldown = isRunning ? 0.12 : 0.18;
+    const finalCooldown = Math.max(adjustedCooldown, minCooldown);
+
+    // Process left foot using hitToi distance detection (works for all animations including crouch)
+    let leftHit = null;
+    if (this.leftFootBone) {
+      this.leftFootBone.getWorldPosition(this.leftFootWorldPosition);
+
+      if (!this.leftFootInitialized) {
+        this.prevLeftFootPosition.copy(this.leftFootWorldPosition);
+        this.leftFootInitialized = true;
+      } else {
+        // Calculate vertical velocity and movement
+        const verticalVelocity =
+          (this.leftFootWorldPosition.y - this.prevLeftFootPosition.y) /
+          Math.max(delta, 1e-4);
+        const verticalDelta =
+          this.prevLeftFootPosition.y - this.leftFootWorldPosition.y;
+        const movementDelta = Math.sqrt(
+          Math.pow(
+            this.leftFootWorldPosition.x - this.prevLeftFootPosition.x,
+            2
+          ) +
+            Math.pow(
+              this.leftFootWorldPosition.z - this.prevLeftFootPosition.z,
+              2
+            )
+        );
+
+        const hit = this.castFootRay(this.leftFootWorldPosition);
+        const hitToi = hit?.hitToi ?? null;
+        const slopeFactor = hit?.slopeFactor ?? 0;
+
+        // Foot is grounded if hitToi is small (foot close to ground)
+        // Use slightly larger threshold for steep slopes
+        const groundedFoot =
+          typeof hitToi === "number" &&
+          hitToi < (slopeFactor > 0.4 ? 0.28 : 0.23);
+
+        // Trigger footstep ONLY on transition from not grounded to grounded
+        // This prevents multiple triggers per footstep
+        const triggered =
+          groundedFoot &&
+          !this.leftFootWasGrounded &&
+          this.footstepCooldown <= 0 &&
+          (verticalVelocity < -0.02 ||
+            verticalDelta > 0.006 ||
+            slopeFactor > 0.35 ||
+            movementDelta > 0.02);
+
+        if (triggered) {
+          leftHit = hit;
+          // Set cooldown immediately to prevent both feet triggering in same frame
+          this.footstepCooldown = finalCooldown;
+        }
+
+        this.prevLeftFootPosition.copy(this.leftFootWorldPosition);
+        this.leftFootWasGrounded = groundedFoot;
+        this.leftFootPrevToi =
+          groundedFoot && typeof hitToi === "number" ? hitToi : 1;
+      }
+    }
+
+    // Process right foot
+    let rightHit = null;
+    if (this.rightFootBone) {
+      this.rightFootBone.getWorldPosition(this.rightFootWorldPosition);
+
+      if (!this.rightFootInitialized) {
+        this.prevRightFootPosition.copy(this.rightFootWorldPosition);
+        this.rightFootInitialized = true;
+      } else {
+        // Calculate vertical velocity and movement
+        const verticalVelocity =
+          (this.rightFootWorldPosition.y - this.prevRightFootPosition.y) /
+          Math.max(delta, 1e-4);
+        const verticalDelta =
+          this.prevRightFootPosition.y - this.rightFootWorldPosition.y;
+        const movementDelta = Math.sqrt(
+          Math.pow(
+            this.rightFootWorldPosition.x - this.prevRightFootPosition.x,
+            2
+          ) +
+            Math.pow(
+              this.rightFootWorldPosition.z - this.prevRightFootPosition.z,
+              2
+            )
+        );
+
+        const hit = this.castFootRay(this.rightFootWorldPosition);
+        const hitToi = hit?.hitToi ?? null;
+        const slopeFactor = hit?.slopeFactor ?? 0;
+
+        // Foot is grounded if hitToi is small (foot close to ground)
+        const groundedFoot =
+          typeof hitToi === "number" &&
+          hitToi < (slopeFactor > 0.4 ? 0.28 : 0.23);
+
+        // Trigger footstep ONLY on transition from not grounded to grounded
+        // This prevents multiple triggers per footstep
+        const triggered =
+          groundedFoot &&
+          !this.rightFootWasGrounded &&
+          this.footstepCooldown <= 0 &&
+          (verticalVelocity < -0.02 ||
+            verticalDelta > 0.006 ||
+            slopeFactor > 0.35 ||
+            movementDelta > 0.02);
+
+        if (triggered) {
+          rightHit = hit;
+          // Set cooldown immediately to prevent both feet triggering in same frame
+          this.footstepCooldown = finalCooldown;
+        }
+
+        this.prevRightFootPosition.copy(this.rightFootWorldPosition);
+        this.rightFootWasGrounded = groundedFoot;
+        this.rightFootPrevToi =
+          groundedFoot && typeof hitToi === "number" ? hitToi : 1;
+      }
+    }
+
+    // Play footstep sound and spawn particles if either foot triggered
+    // Cooldown is already set when foot triggers, so we just need to play sound once
+    if (leftHit || rightHit) {
+      const volumeMultiplier = isRunning
+        ? 1.2
+        : this.currentAnimation === "crouchWalk"
+        ? 0.7
+        : 1.0;
+      this.playFootstepSound(volumeMultiplier);
+
+      // Spawn footstep particles
+      if (this.config.enableFootstepParticles && this.footstepParticles) {
+        const hitsToProcess = [];
+        if (leftHit) hitsToProcess.push(leftHit);
+        if (rightHit) hitsToProcess.push(rightHit);
+
+        hitsToProcess.forEach((hit) => {
+          if (hit) {
+            this.footstepParticles.spawn({
+              position: hit.point,
+              normal: hit.normal,
+              slopeFactor: hit.slopeFactor,
+            });
+          }
+        });
+      }
+    }
   }
 
   normalizeAngle(angle) {
@@ -750,6 +940,14 @@ export class CharacterController {
   update(delta, interpolationAlpha = 0) {
     if (!this.rigidBody) return;
 
+    // Force reset animationGroup position and rotation every frame to prevent jitter/sliding
+    // This matches the approach in wawa-game-template for smooth animations
+    // Do this BEFORE mixer update to ensure clean state
+    if (this.animationGroup) {
+      this.animationGroup.position.set(0, this.currentCharacterYOffset, 0);
+      this.animationGroup.rotation.set(0, 0, 0);
+    }
+
     // Update animation mixer
     if (this.mixer) {
       this.mixer.update(delta);
@@ -764,8 +962,16 @@ export class CharacterController {
     // Footstep cooldown
     this.footstepCooldown = Math.max(this.footstepCooldown - delta, 0);
 
+    // Update footstep particles
+    if (this.footstepParticles) {
+      this.footstepParticles.update(delta);
+    }
+
     const vel = this.rigidBody.linvel();
     if (!vel) return;
+
+    // Update foot positions and detect footsteps
+    this.updateFootsteps(delta);
 
     // Ground detection
     let grounded = this.checkGroundedRapier();
@@ -825,6 +1031,61 @@ export class CharacterController {
         this.footstepCooldown = 0.25;
       }
 
+      // Spawn landing particles
+      if (this.config.enableFootstepParticles && this.footstepParticles) {
+        const landingHits = [];
+
+        // Try to get foot positions first
+        if (this.leftFootBone) {
+          this.leftFootBone.getWorldPosition(this.leftFootWorldPosition);
+          const hit = this.castFootRay(this.leftFootWorldPosition);
+          if (hit) landingHits.push(hit);
+        }
+        if (this.rightFootBone) {
+          this.rightFootBone.getWorldPosition(this.rightFootWorldPosition);
+          const hit = this.castFootRay(this.rightFootWorldPosition);
+          if (hit) landingHits.push(hit);
+        }
+
+        // Try center position
+        if (landingHits.length === 0 && this.character) {
+          const centerPos = new THREE.Vector3();
+          this.character.getWorldPosition(centerPos);
+          const hit = this.castFootRay(centerPos);
+          if (hit) landingHits.push(hit);
+        }
+
+        // Fallback: spawn at bottom of capsule even if raycast fails
+        if (landingHits.length === 0 && this.rigidBody) {
+          const position = this.rigidBody.translation();
+          const currentHalfHeight = this.currentCapsuleHalfHeight;
+          // Position at bottom of capsule (where feet touch ground)
+          const bottomPos = new THREE.Vector3(
+            position.x,
+            position.y - currentHalfHeight - this.config.capsuleRadius,
+            position.z
+          );
+          // Create a fallback hit even if raycast doesn't work
+          landingHits.push({
+            point: bottomPos,
+            normal: new THREE.Vector3(0, 1, 0),
+            slopeFactor: 0,
+            hitToi: 0,
+          });
+        }
+
+        // Spawn particles for all landing hits
+        landingHits.forEach((hit) => {
+          if (hit) {
+            this.footstepParticles.spawn({
+              position: hit.point,
+              normal: hit.normal,
+              slopeFactor: hit.slopeFactor,
+            });
+          }
+        });
+      }
+
       setTimeout(() => {
         if (this.jumpPhase === "land") {
           this.jumpPhase = "none";
@@ -832,7 +1093,7 @@ export class CharacterController {
       }, 300);
     }
 
-    // Roll input
+    // Roll input - check after landing but before movement animations
     if (
       this.keys.roll &&
       !this.rollPressed &&
@@ -853,11 +1114,18 @@ export class CharacterController {
 
       const rollSpeed = this.config.RUN_SPEED * 1.2;
       const facingRotation = this.rotationTarget + this.characterRotationTarget;
+
+      // Store roll direction and speed for maintaining velocity during roll
+      this.rollDirection = facingRotation;
+      this.rollSpeed = rollSpeed;
+
       vel.x = Math.sin(facingRotation) * rollSpeed;
       vel.z = Math.cos(facingRotation) * rollSpeed;
 
       setTimeout(() => {
         this.isRolling = false;
+        this.rollDirection = undefined;
+        this.rollSpeed = undefined;
         // Restore capsule to standing height when roll ends
         const standingHalfHeight = this.config.capsuleHeight / 2;
         this.updateCapsuleCollider(standingHalfHeight);
@@ -950,7 +1218,7 @@ export class CharacterController {
         intendedVelZ = -intendedVelZ;
       }
 
-      if (grounded && this.jumpPhase !== "land") {
+      if (grounded && this.jumpPhase !== "land" && !this.isRolling) {
         vel.x = intendedVelX;
         vel.z = intendedVelZ;
       }
@@ -975,7 +1243,7 @@ export class CharacterController {
         this.jumpPressed = false;
       }
 
-      // Movement animations - only if not jumping and not in any jump phase
+      // Movement animations - only if not jumping and not in any jump phase and not rolling
       const isInJumpPhase = this.jumpPhase !== "none";
       if (
         grounded &&
@@ -998,7 +1266,7 @@ export class CharacterController {
       }
     } else {
       // No movement
-      if (grounded) {
+      if (grounded && !this.isRolling) {
         vel.x *= 0.85;
         vel.z *= 0.85;
 
@@ -1055,6 +1323,21 @@ export class CharacterController {
         targetRotation,
         0.1
       );
+    }
+
+    // Maintain roll velocity during roll (prevent slowdown from damping)
+    // This ensures roll maintains speed like jump does - constant velocity throughout
+    // Do this RIGHT BEFORE setting velocity to override any damping or movement input
+    if (
+      this.isRolling &&
+      grounded &&
+      this.rollDirection !== undefined &&
+      this.rollSpeed !== undefined
+    ) {
+      // Maintain constant roll speed throughout the roll
+      // This prevents the "no movement" damping from slowing down the roll
+      vel.x = Math.sin(this.rollDirection) * this.rollSpeed;
+      vel.z = Math.cos(this.rollDirection) * this.rollSpeed;
     }
 
     // Update velocity
@@ -1162,6 +1445,12 @@ export class CharacterController {
 
     if (this.rigidBody && this.world) {
       this.world.removeRigidBody(this.rigidBody);
+    }
+
+    // Dispose footstep particles
+    if (this.footstepParticles) {
+      this.footstepParticles.dispose();
+      this.footstepParticles = null;
     }
 
     this.scene.remove(this.container);

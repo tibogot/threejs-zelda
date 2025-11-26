@@ -261,12 +261,37 @@ export class GameScene {
   }
 
   private setupCharacterControls(): void {
-    if (!this.characterController) return;
+    if (!this.characterController || !this.controlsManager) return;
 
-    // Note: FollowCameraControls may need to be updated to work with new CharacterController API
-    // The new CharacterController uses config object for camera settings
-    // For now, we'll skip FollowCameraControls setup since it expects methods that don't exist
-    // You can manually adjust camera settings via characterController.config if needed
+    // Character Footstep Controls
+    const characterFootstepFolder = this.controlsManager.getFolder(
+      "👣 Character Footsteps",
+      {
+        expanded: true,
+      }
+    );
+
+    const footstepParams = {
+      enableFootstepAudio: this.characterController.config.enableFootstepAudio,
+      enableFootstepParticles:
+        this.characterController.config.enableFootstepParticles,
+    };
+
+    characterFootstepFolder
+      .addBinding(footstepParams, "enableFootstepAudio", {
+        label: "Footstep Sounds",
+      })
+      .on("change", (ev: { value: boolean }) => {
+        this.characterController!.config.enableFootstepAudio = ev.value;
+      });
+
+    characterFootstepFolder
+      .addBinding(footstepParams, "enableFootstepParticles", {
+        label: "Footstep Particles",
+      })
+      .on("change", (ev: { value: boolean }) => {
+        this.characterController!.config.enableFootstepParticles = ev.value;
+      });
   }
 
   private setupControls(): void {
@@ -355,6 +380,21 @@ export class GameScene {
     this.csmControls.setOnCSMRecreated((newCSM) => {
       this.csm = newCSM;
     });
+
+    // Physics Debug Controls
+    const physicsFolder = this.controlsManager.getFolder("⚙️ Physics Debug", {
+      expanded: false,
+    });
+    const physicsParams = {
+      rapierDebugEnabled: this.rapierDebugRenderer.isEnabled(),
+    };
+    physicsFolder
+      .addBinding(physicsParams, "rapierDebugEnabled", {
+        label: "Rapier Debug Renderer",
+      })
+      .on("change", (ev: { value: boolean }) => {
+        this.rapierDebugRenderer.setEnabled(ev.value);
+      });
 
     console.log("Controls setup complete");
   }
